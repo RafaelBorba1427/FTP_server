@@ -2,4 +2,4 @@
 # Server_trial
 =======
 # FTP_server
->>>>>>> ec64f5b28469f5e1251d8f032b4f2eaa898dc116
+>>>>>>> This is my first repository. The file present is made with the intent of making my first bash script to add a TUI to a ssh connection 
