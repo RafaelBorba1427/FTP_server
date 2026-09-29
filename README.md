@@ -1,5 +1,4 @@
-<<<<<<< HEAD
-# Server_trial
-=======
-# FTP_server
->>>>>>> This is my first repository. The file present is made with the intent of making my first bash script to add a TUI to a ssh connection 
+FTP communication using c++ using the ASIO library
+->acceptor method creates an object that is responsable for listening for incomming connections
+
+
