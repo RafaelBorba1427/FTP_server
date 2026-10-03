@@ -1,99 +1,226 @@
+#include <array>
 #include <asio.hpp>
-#include <bits/stdc++.h>
-#include <cstddef>
-std::vector<uint8_t> vByts(20 * 1024);
+#include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+
+struct Reply {
+  int code;
+  std::string text;
+};
+
+// Keep this buffer across reads: TCP can deliver several replies together.
+Reply readReply(asio::ip::tcp::socket &socket, asio::streambuf &buffer) {
+  auto readLine = [&]() {
+    asio::read_until(socket, buffer, "\r\n");
+    std::istream input(&buffer);
+    std::string line;
+    std::getline(input, line);
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
+    std::cout << line << '\n';
+    return line;
+  };
+  std::string first = readLine();
+  if (first.size() < 4 || !std::isdigit(static_cast<unsigned char>(first[0])) ||
+      !std::isdigit(static_cast<unsigned char>(first[1])) ||
+      !std::isdigit(static_cast<unsigned char>(first[2])) ||
+      (first[3] != ' ' && first[3] != '-'))
+    throw std::runtime_error("Invalid FTP reply");
+  int code = std::stoi(first.substr(0, 3));
+  std::string text = first;
+  if (first[3] == '-') {
+    const std::string ending = first.substr(0, 3) + " ";
+    for (;;) {
+      auto line = readLine();
+      text += '\n' + line;
+      if (line.compare(0, ending.size(), ending) == 0)
+        break;
+    }
+  }
+  return {code, text};
+}
+
+void sendCommand(asio::ip::tcp::socket &socket, const std::string &command) {
+  std::string line = command + "\r\n";
+  asio::write(socket, asio::buffer(line)); // Send the entire command.
+}
+
+std::pair<std::string, std::string> splitCommand(const std::string &line) {
+  auto space = line.find(' ');
+  auto name = line.substr(0, space);
+  for (auto &c : name)
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  return {name, space == std::string::npos ? "" : line.substr(space + 1)};
+}
+
+asio::ip::tcp::endpoint passiveEndpoint(const Reply &reply) {
+  auto begin = reply.text.find('(');
+  auto end = reply.text.find(')', begin);
+  if (begin == std::string::npos || end == std::string::npos)
+    throw std::runtime_error("Invalid PASV reply");
+  std::string numbers = reply.text.substr(begin + 1, end - begin - 1);
+  for (auto &c : numbers)
+    if (c == ',')
+      c = ' ';
+  std::istringstream input(numbers);
+  std::array<int, 6> fields{};
+  for (auto &field : fields) {
+    if (!(input >> field) || field < 0 || field > 255)
+      throw std::runtime_error("Invalid PASV endpoint");
+  }
+  std::string address =
+      std::to_string(fields[0]) + "." + std::to_string(fields[1]) + "." +
+      std::to_string(fields[2]) + "." + std::to_string(fields[3]);
+  return {asio::ip::make_address(address),
+          static_cast<unsigned short>(fields[4] * 256 + fields[5])};
+}
 
 int main() {
-  asio::io_context context;
-  asio::ip::tcp::socket socket(context);
-  asio::error_code ec;
-  socket.connect(asio::ip::tcp::endpoint(asio::ip::tcp::v4(), 2121), ec);
-  if (!ec) {
-    std::cout << "Connected ";
-    std::string current_path;
-    while (true) {
-      std::cout << "What do you want to do?CWD, PWD \n";
-      std::string command;
-      std::getline(std::cin, command);
-      std::string request = "PASV\r\n";
+  try {
+    asio::io_context context;
+    asio::ip::tcp::socket socket(context);
+    socket.connect({asio::ip::make_address("127.0.0.1"), 2121});
+    asio::streambuf replies;
+    if (readReply(socket, replies).code != 220)
+      return 1;
 
-      if (command.find("CWD") != std::string::npos ||
-          command.find("CDUP") != std::string::npos) {
-        command.append("\r\n");
-
-        request = command;
-        socket.write_some(asio::buffer(request.data(), request.size()));
-        socket.wait(socket.wait_write);
-
-      } else if (command.find("QUIT") != std::string::npos) {
-        command.append("\r\n");
-        request = command;
-        socket.write_some(asio::buffer(request.data(), request.size()));
-        socket.shutdown(asio::ip::tcp::socket::shutdown_send);
+    for (;;) {
+      std::string username, password;
+      std::cout << "Username: ";
+      if (!std::getline(std::cin, username))
+        return 0;
+      sendCommand(socket, "USER " + username);
+      auto reply = readReply(socket, replies);
+      if (reply.code == 230)
         break;
-      } else if (command.find("PWD") != std::string::npos) {
-        command.append("\r\n");
-        request = command;
-
-        socket.write_some(asio::buffer(request.data(), request.size()));
-
-        std::size_t n =
-
-            socket.read_some(asio::buffer(vByts.data(), vByts.size()), ec);
-        // socket.wait(socket.wait_read);
-        std::cout << std::string(reinterpret_cast<const char *>(vByts.data()),
-                                 n)
-                  << " is the PWD\n";
-      } else {
-
-        socket.write_some(asio::buffer(request.data(), request.size()));
-        socket.wait(socket.wait_write);
-        std::size_t n =
-            socket.read_some(asio::buffer(vByts.data(), vByts.size()), ec);
-
-        std::string s(reinterpret_cast<const char *>(vByts.data()), n);
-        std::cout << s << std::endl;
-        asio::ip::tcp::socket socket2(context);
-        char *tok = std::strtok(s.data(), "(");
-        tok = std::strtok(nullptr, ")");
-        char *info = std::strtok(tok, ",");
-        int count = 0;
-        std::string newIp;
-        int port, portA, portB;
-        while (info != nullptr) {
-          std::cout << info << " is tok\n";
-          if (count < 4) {
-            std::string aux(info);
-            newIp.append(aux);
-            if (count < 3) {
-              newIp.push_back('.');
-            }
-          } else {
-            if (count == 4)
-              portA = std::stoi(info);
-
-            else {
-              port = portA * 256 + std::stoi(info);
-            }
-          }
-          count++;
-          info = std::strtok(nullptr, ",");
-        }
-        std::cout << "IP is: " << newIp << " and port is:" << port << std::endl;
-        socket2.connect(
-            asio::ip::tcp::endpoint(asio::ip::make_address(newIp), port), ec);
-        std::string response = "LIST\r\n";
-        socket.write_some(asio::buffer(response.data(), response.size()), ec);
-        if (!ec || ec == asio::error::eof) {
-          n = socket2.read_some(asio::buffer(vByts.data(), vByts.size()), ec);
-          if (!ec || ec == asio::error::eof) {
-            std::cout.write(reinterpret_cast<const char *>(vByts.data()), n);
-          }
-        }
-      }
+      if (reply.code != 331)
+        continue;
+      std::cout << "Password: ";
+      if (!std::getline(std::cin, password))
+        return 0;
+      sendCommand(socket, "PASS " + password);
+      password.clear();
+      if (readReply(socket, replies).code == 230)
+        break;
     }
 
-  } else {
-    std::cout << ec;
+    std::unique_ptr<asio::ip::tcp::socket> dataSocket;
+    for (;;) {
+      std::cout
+          << "FTP command (PASV, LIST, RETR, STOR, PWD, CWD, RNFR, QUIT): ";
+      std::string line;
+      if (!std::getline(std::cin, line)) {
+        sendCommand(socket, "QUIT");
+        readReply(socket, replies);
+        break;
+      }
+      auto [command, argument] = splitCommand(line);
+      if (command.empty())
+        continue;
+      if (command == "MKDIR")
+        command = "MKD";
+      line = command + (argument.empty() ? "" : " " + argument);
+      bool transfer =
+          command == "LIST" || command == "RETR" || command == "STOR";
+      std::ifstream source;
+      std::ofstream destination;
+      if (transfer) {
+        if ((command == "RETR" || command == "STOR") && argument.empty()) {
+          std::cerr << "A filename is required\n";
+          continue;
+        }
+        if (command == "STOR") {
+          source.open(argument, std::ios::binary);
+          if (!source) {
+            std::cerr << "Cannot open local source file\n";
+            continue;
+          }
+        }
+        // Preserve the existing workflow: PASV may be issued explicitly.
+        // Otherwise negotiate it automatically before a transfer.
+        if (!dataSocket) {
+          sendCommand(socket, "PASV");
+          auto passive = readReply(socket, replies);
+          if (passive.code != 227)
+            continue;
+          dataSocket = std::make_unique<asio::ip::tcp::socket>(context);
+          dataSocket->connect(passiveEndpoint(passive));
+        }
+      }
+      sendCommand(socket, line);
+      auto reply = readReply(socket, replies);
+      if (command == "PASV") {
+        dataSocket.reset();
+        if (reply.code == 227) {
+          dataSocket = std::make_unique<asio::ip::tcp::socket>(context);
+          dataSocket->connect(passiveEndpoint(reply));
+        }
+      } else if (transfer) {
+        if (reply.code != 150 && reply.code != 125) {
+          dataSocket.reset();
+          continue;
+        }
+        std::array<char, 20 * 1024> data{};
+        if (command == "STOR") {
+          while (source.read(data.data(), data.size()) || source.gcount() > 0)
+            asio::write(*dataSocket,
+                        asio::buffer(data.data(), source.gcount()));
+          if (source.bad())
+            throw std::runtime_error("Local file read failed");
+          dataSocket->shutdown(asio::ip::tcp::socket::shutdown_send);
+        } else {
+          if (command == "RETR") {
+            destination.open(std::filesystem::path(argument).filename(),
+                             std::ios::binary);
+            if (!destination)
+              throw std::runtime_error("Cannot open local destination file");
+          }
+          for (;;) {
+            asio::error_code error;
+            auto size = dataSocket->read_some(asio::buffer(data), error);
+            if (size) {
+              if (command == "LIST")
+                std::cout.write(data.data(), size);
+              else {
+                destination.write(data.data(), size);
+                if (!destination)
+                  throw std::runtime_error("Local file write failed");
+              }
+            }
+            if (error == asio::error::eof)
+              break;
+            if (error)
+              throw asio::system_error(error);
+          }
+          if (command == "RETR") {
+            destination.close();
+            if (destination.fail())
+              throw std::runtime_error("Local file close failed");
+          }
+        }
+        dataSocket.reset();
+        readReply(socket, replies); // Consume the transfer's final reply.
+      } else if (command == "QUIT") {
+        break; // 221 has been received before disconnecting.
+      } else if (command == "RNFR" && reply.code == 350) {
+        std::cout << "Destination (RNTO new-name): ";
+        if (!std::getline(std::cin, line))
+          break;
+        auto destinationCommand = splitCommand(line);
+        if (destinationCommand.first != "RNTO")
+          line = "RNTO " + line;
+        sendCommand(socket, line);
+        readReply(socket, replies);
+      }
+    }
+  } catch (const std::exception &error) {
+    std::cerr << "FTP client error: " << error.what() << '\n';
+    return 1;
   }
 }
